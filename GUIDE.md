@@ -3,19 +3,18 @@
 
 **Goal:** Take a real Python app from source code -> hardened container -> pushed to
 Artifact Registry -> deployed on Cloud Run -> blue/green traffic switch -> fully
-automated CI/CD.
+automated, health-gated canary CI/CD via Cloud Build.
 
 > Companion files in this project: `main.py`, `templates/index.html`,
-> `requirements.txt`, `Dockerfile`, `.dockerignore`, `cloudbuild.yaml`,
-> `.github/workflows/deploy.yml` — all sitting flat in one folder
-> (e.g. `C:\Users\MSI\Downloads\app`), matching your actual setup.
+> `requirements.txt`, `Dockerfile`, `.dockerignore`, `cloudbuild.yaml` — all
+> sitting flat in one folder (e.g. `C:\Users\MSI\Downloads\app`).
 
 > **The one rule that prevents 90% of the errors we hit today:** every
 > command in this guide is written as **one single line**. Do not add line
 > breaks or backticks. PowerShell's backtick line-continuation is fragile —
 > a single trailing space after a backtick silently breaks it with no error
-> shown, which is exactly what caused the empty-`$GREEN_URL` problem
-> earlier. If a command looks long, that's fine — paste the whole line.
+> shown, which is exactly what caused an empty-`$GREEN_URL` problem earlier.
+> If a command looks long, that's fine — paste the whole line.
 
 ---
 
@@ -28,8 +27,8 @@ automated CI/CD.
 | 3 | GCP project setup + enabling required services |
 | 4 | Pushing the image to Artifact Registry |
 | 5 | Deploying to Cloud Run |
-| 6 | Blue/Green + canary traffic splitting |
-| 7 | CI/CD automation |
+| 6 | Blue/Green + canary traffic splitting (manual) |
+| 7 | CI/CD automation with Cloud Build (health-gated canary, automated) |
 | 8 | Cleanup |
 
 ---
@@ -68,7 +67,7 @@ Open `Dockerfile` and talk through these decisions live:
    — **not** a virtual environment. A venv's `python3` binary is a symlink
    back to the builder image's interpreter path, which does not exist in
    the distroless final image (a documented limitation of Google's
-   distroless project) — that's what caused the earlier "No module named
+   distroless project) — that's what caused an earlier "No module named
    gunicorn" error. Stage 2 copies only `/deps` + app code, and runs them
    with the distroless image's *own* Python 3.11 via `PYTHONPATH`.
 2. **Distroless final image** (`gcr.io/distroless/python3-debian12:nonroot`
@@ -136,8 +135,8 @@ gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudb
 |---|---|
 | `run.googleapis.com` | Cloud Run itself |
 | `artifactregistry.googleapis.com` | Stores your Docker images (Container Registry is retired) |
-| `cloudbuild.googleapis.com` | Google-side image builds + Cloud Build triggers |
-| `iam.googleapis.com` / `iamcredentials.googleapis.com` / `sts.googleapis.com` | Needed for Workload Identity Federation (Phase 7) |
+| `cloudbuild.googleapis.com` | Cloud Build itself — image builds + triggers |
+| `iam.googleapis.com` / `iamcredentials.googleapis.com` / `sts.googleapis.com` | IAM management, needed for creating the dedicated Cloud Build service account (Phase 7) |
 
 ### 3.4 Set a default region
 
@@ -251,10 +250,12 @@ overwrites one. This is what makes blue/green and instant rollback possible.
 
 ---
 
-## Phase 6 — Blue/Green (and Canary) Deployments
+## Phase 6 — Blue/Green (and Canary) Deployments — Manual
 
 Deploy a new version with `--no-traffic`, validate it at a private tagged
-URL, then shift traffic gradually or all at once, with zero downtime.
+URL, then shift traffic gradually or all at once, with zero downtime. Do
+this manually once to understand the mechanism, before automating it in
+Phase 7.
 
 ### 6.1 Build v2 and deploy "green" without sending it any production traffic
 
@@ -351,78 +352,147 @@ gcloud run services update-traffic cloudrun-demo --region=us-central1 --to-revis
 
 ---
 
-## Phase 7 — CI/CD: Automate the Whole Pipeline
+## Phase 7 — CI/CD: Automate the Whole Pipeline with Cloud Build
 
-Two options included in this project.
+This is the exact, field-tested sequence — including the two things that
+are NOT obvious from Google's own docs and will otherwise cost you an hour
+each: (1) 2nd-gen GitHub connections need a dedicated, non-default service
+account, and (2) any bash-only variable inside a `cloudbuild.yaml` inline
+script must be escaped with `$$`, or Cloud Build tries to resolve it as
+one of its own substitution variables and rejects the whole file before
+running a single step.
 
-### Option A — GitHub Actions with Workload Identity Federation (recommended)
+### 7.1 Connect your GitHub repo (one-time, browser-based — can't be scripted)
 
-No long-lived secret sits in GitHub — GitHub's OIDC token is exchanged for
-a short-lived GCP token at run time.
+Console -> **Cloud Build** -> **Repositories** -> **Link repository** ->
+in the **Connection** dropdown, choose **+ Create new connection** ->
+Region `us-central1` -> Provider **GitHub** -> authorize Google Cloud
+Build's GitHub App in the OAuth popup -> pick your repo -> leave
+"Repository name: Generated" -> **Link**.
 
-**One-time setup** (these are bash-style multi-line commands but you're
-running them once from your own terminal to configure GCP, not from
-PowerShell — if you're doing this from PowerShell too, run each `gcloud`
-command below as a single line, same rule as everywhere else in this guide):
+### 7.2 Get the exact resource names (don't guess these)
 
 ```powershell
-$env:PROJECT_ID = (gcloud config get-value project)
+gcloud builds connections list --region=us-central1
+```
+
+This prints your connection's `NAME` (e.g. `conn`). Use it here:
+
+```powershell
+gcloud builds repositories list --connection=conn --region=us-central1
+```
+
+This prints the repository resource `NAME` (e.g.
+`your-username-your-repo-name`, auto-prefixed with your GitHub username).
+Combine both into the full path you'll need next:
+
+```
+projects/YOUR_PROJECT_ID/locations/us-central1/connections/conn/repositories/your-username-your-repo-name
+```
+
+### 7.3 Create a DEDICATED service account — do not use the default one
+
+This is the step that isn't documented clearly anywhere. The *default*
+Cloud Build service account (`PROJECT_NUMBER@cloudbuild.gserviceaccount.com`)
+gets rejected at build-run time with `invalid value for
+'build.service_account': provide a user-managed service account or leave
+unset`. Simply *omitting* `--service-account` also fails, but at
+trigger-*creation* time, with a bare `INVALID_ARGUMENT`. The combination
+that actually works is a genuinely separate, user-created service account:
+
+```powershell
+gcloud iam service-accounts create cloudbuild-deployer --display-name="Cloud Build Deploy SA"
+```
+
+Grant it every role it needs — run each one **separately**. If prompted
+with a condition selection menu (this happens because the connection setup
+in 7.1 created a conditional IAM binding elsewhere in the policy), type
+`2` for **None**:
+
+```powershell
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:cloudbuild-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/run.admin"
 ```
 
 ```powershell
-$env:PROJECT_NUMBER = (gcloud projects describe $env:PROJECT_ID --format="value(projectNumber)")
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:cloudbuild-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/artifactregistry.writer"
 ```
 
 ```powershell
-$env:REPO = "your-github-username/your-repo-name"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:cloudbuild-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/iam.serviceAccountUser"
 ```
 
 ```powershell
-gcloud iam workload-identity-pools create "github-pool" --location="global" --display-name="GitHub Actions Pool"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:cloudbuild-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudbuild.builds.builder"
+```
+
+| Role | Why it's needed |
+|---|---|
+| `roles/run.admin` | Deploy/update the Cloud Run service and shift traffic |
+| `roles/artifactregistry.writer` | Push built images |
+| `roles/iam.serviceAccountUser` | Allowed to "act as" the Cloud Run runtime service account |
+| `roles/cloudbuild.builds.builder` | Allowed to actually execute build steps (the default SA has this automatically; a new custom SA does not) |
+
+### 7.4 Create the trigger, pointing at that dedicated service account
+
+```powershell
+gcloud builds triggers create github --name=cloudrun-demo-trigger --repository="projects/YOUR_PROJECT_ID/locations/us-central1/connections/conn/repositories/your-username-your-repo-name" --branch-pattern="^main$" --build-config="cloudbuild.yaml" --region=us-central1 --service-account="projects/YOUR_PROJECT_ID/serviceAccounts/cloudbuild-deployer@YOUR_PROJECT_ID.iam.gserviceaccount.com"
+```
+
+### 7.5 What `cloudbuild.yaml` actually does
+
+The companion `cloudbuild.yaml` in this project is a health-gated, gradual
+canary pipeline — the same shape a real production rollout uses, not a
+straight cutover:
+
+1. **Build** the image
+2. **Push** both the commit-SHA tag and `latest` to Artifact Registry
+3. **Deploy green at 0% traffic** (`--no-traffic --tag=green`) — blue keeps
+   serving 100% of real users throughout
+4. **Smoke test gate** — looks up green's private tagged URL via JSON
+   (never `--filter`, `describe` doesn't support it) and polls `/health`
+   with retries. **If this fails, the whole build stops here** — green
+   never receives a single percent of traffic, blue is untouched.
+5. **Canary to 10%**, then a short observed pause
+6. **Canary to 50%**, then another pause
+7. **Promote to 100%**
+
+> Inside that YAML, any all-caps variable meant for bash (like
+> `$GREEN_URL`) is written as `$$GREEN_URL`. Cloud Build statically scans
+> the *entire* file — including text inside inline bash scripts — for
+> `$UPPERCASE_NAME` patterns and tries to resolve them as its own
+> substitution variables before the build even starts. An unescaped
+> bash-only variable fails validation with something like `key in the
+> template "GREEN_URL" is not a valid built-in substitution`, with zero
+> steps having run yet. Real Cloud Build substitutions like `${_SERVICE}`
+> or the built-in `${SHORT_SHA}` are left as single `$` on purpose — only
+> escape the ones that are meant for the shell, not for Cloud Build.
+
+The pauses between canary stages are just `sleep` calls, shortened for a
+live demo (`_CANARY_WAIT_SECONDS` substitution, default 30s). Say this out
+loud when presenting: real production canary analysis watches actual
+error-rate/latency metrics (e.g. via Cloud Monitoring) during that window
+automatically, rather than a fixed timer.
+
+### 7.6 Test it
+
+```powershell
+git add .
 ```
 
 ```powershell
-gcloud iam workload-identity-pools providers create-oidc "github-provider" --location="global" --workload-identity-pool="github-pool" --display-name="GitHub provider" --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" --attribute-condition="assertion.repository=='$($env:REPO)'" --issuer-uri="https://token.actions.githubusercontent.com"
+git commit -m "test cloud build trigger"
 ```
 
 ```powershell
-gcloud iam service-accounts create github-deployer --display-name="GitHub Actions Cloud Run Deployer"
+git push origin main
 ```
 
-```powershell
-gcloud projects add-iam-policy-binding $env:PROJECT_ID --member="serviceAccount:github-deployer@$($env:PROJECT_ID).iam.gserviceaccount.com" --role="roles/run.admin"
-```
-
-```powershell
-gcloud projects add-iam-policy-binding $env:PROJECT_ID --member="serviceAccount:github-deployer@$($env:PROJECT_ID).iam.gserviceaccount.com" --role="roles/artifactregistry.writer"
-```
-
-```powershell
-gcloud projects add-iam-policy-binding $env:PROJECT_ID --member="serviceAccount:github-deployer@$($env:PROJECT_ID).iam.gserviceaccount.com" --role="roles/iam.serviceAccountUser"
-```
-
-```powershell
-gcloud iam service-accounts add-iam-policy-binding "github-deployer@$($env:PROJECT_ID).iam.gserviceaccount.com" --role="roles/iam.workloadIdentityUser" --member="principalSet://iam.googleapis.com/projects/$($env:PROJECT_NUMBER)/locations/global/workloadIdentityPools/github-pool/attribute.repository/$($env:REPO)"
-```
-
-Then edit `.github/workflows/deploy.yml`:
-- Replace `your-gcp-project-id` with your real project ID
-- Replace `PROJECT_NUMBER` in the `workload_identity_provider` line with
-  your real project number
-
-Push to `main` -> GitHub Actions builds, pushes to Artifact Registry,
-deploys with `--no-traffic --tag=green`, smoke-tests it, then promotes to
-100% automatically. (The workflow's own commands run on GitHub's Linux
-runners, so they use normal bash — nothing to translate there.)
-
-### Option B — Native Cloud Build trigger (simpler, no GitHub secrets at all)
-
-```powershell
-gcloud builds triggers create github --repo-name="your-repo-name" --repo-owner="your-github-username" --branch-pattern="^main$" --build-config="cloudbuild.yaml"
-```
-
-Cloud Build runs *inside* GCP with its own service account — nothing
-external to configure.
+Watch it run: Console -> **Cloud Build** -> **History** -> open the build.
+You should see all the steps listed above (build, push x2, deploy-green,
+smoke-test, canary-10, observe-10, canary-50, observe-50, promote-100). If
+you catch it during an "observe" step, quickly check **Cloud Run ->
+cloudrun-demo -> Revisions** — you'll see the live traffic split (10% or
+50%) in real time.
 
 ---
 
@@ -436,7 +506,9 @@ gcloud run services delete cloudrun-demo --region=us-central1
 gcloud artifacts repositories delete cloudrun-demo-repo --location=us-central1
 ```
 
-Or, simplest of all after the class:
+Or, simplest of all after the class — this also removes the Cloud Build
+trigger, connection, and IAM bindings in one shot, with a 30-day undo
+window (`gcloud projects undelete YOUR_PROJECT_ID`):
 
 ```powershell
 gcloud projects delete your-unique-project-id
@@ -452,7 +524,7 @@ gcloud projects delete your-unique-project-id
 4. Deploy v1 ("blue"), open the live URL (3 min)
 5. Deploy v2 ("green") with `--no-traffic --tag=green`, hit the tagged URL (3 min)
 6. `update-traffic --to-tags green=10/50/100` while refreshing the browser (4 min)
-7. Push a commit -> GitHub Actions pipeline runs live -> auto blue/green (5 min)
+7. Push a commit -> Cloud Build trigger runs live -> automated health-gated canary rollout (5 min)
 8. Q&A / cleanup (2 min)
 
 ---
@@ -473,9 +545,14 @@ gcloud projects delete your-unique-project-id
 | `PERMISSION_DENIED` on `gcloud run deploy` | An API isn't enabled — re-run the Phase 3.3 command |
 | `docker push` gets `denied` | Run `gcloud auth configure-docker us-central1-docker.pkg.dev` again |
 | `service.spec...image: expected a container image path...` | Your `--image` value contains a literal, un-expanded `${...}` — use `"$($env:IMAGE)"` |
+| `INVALID_ARGUMENT` on `gcloud builds triggers create github` (legacy flags) | You're using the legacy 1st-gen `--repo-name`/`--repo-owner` flags — needs a 2nd-gen repository connection instead (Phase 7.1) |
+| `INVALID_ARGUMENT` on `gcloud builds triggers create github` (2nd-gen path) | Either you passed a full URL instead of a bare repo name somewhere, or `--service-account` is missing entirely (needed at creation time even though it seems optional) |
+| Trigger creates fine but the *build* fails: `invalid value for 'build.service_account'` | You pointed the trigger at the **default** Cloud Build service account — create a dedicated one instead (Phase 7.3) |
+| `key in the template "..." is not a valid built-in substitution` | An all-caps bash variable in a `cloudbuild.yaml` inline script wasn't escaped — change `$VARNAME` to `$$VARNAME` for anything meant for bash, not Cloud Build |
+| A `gcloud ... add-iam-policy-binding` command asks you to choose `[1] [2] [3]` for a condition | The project's IAM policy already has a conditional binding (usually from the Cloud Build connection setup) — type `2` for **None** to add your new grant unconditionally |
+| Cloud Build trigger doesn't fire on push | Confirm you pushed to the exact branch in `--branch-pattern` (`^main$` matches only `main`), and that the repo shown in the trigger matches the one you linked |
 | Container fails to start on Cloud Run | Not listening on `$PORT`, or crashing on boot — check `gcloud run services logs read cloudrun-demo --region=us-central1` |
 | Tagged URL 404s | Confirm the tag name matches exactly |
-| GitHub Actions `auth` step fails | `workload_identity_provider` needs your **project number**, not project ID; `attribute-condition` repo string must match your repo exactly |
 
 ---
 
@@ -485,9 +562,14 @@ gcloud projects delete your-unique-project-id
   through 2025.
 - **Distroless + multi-stage + non-root + `pip install --target`** —
   minimal attack surface, no interpreter-path mismatch across stages.
-- **Workload Identity Federation over service-account JSON keys** —
-  Google's current recommended CI/CD auth pattern; no long-lived secrets.
+- **2nd-gen Cloud Build GitHub connections + a dedicated, non-default
+  service account** — the legacy 1st-gen trigger flags and the default
+  Cloud Build service account are both dead ends under current policy;
+  Google's own docs don't make this obvious.
 - **Revision-based blue/green via `--no-traffic` + tags** — Cloud Run's
   native mechanism, no extra infrastructure required.
+- **Health-gated, gradual canary rollout in CI** — the automated pipeline
+  mirrors real production practice (deploy dark, smoke-test, ramp
+  gradually) instead of a straight-to-100% promotion.
 - **Scale-to-zero (`min-instances=0`)** — keeps a classroom demo essentially
   free.
