@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cloud Run Demo &mdash; {{ meta.service }}</title>
+<style>
+  :root { --accent: {{ accent }}; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: radial-gradient(circle at top left, #0f172a, #020617 70%);
+    color: #e2e8f0;
+    padding: 24px;
+  }
+  .card {
+    width: 100%;
+    max-width: 640px;
+    background: #0b1120;
+    border: 1px solid rgba(148, 163, 184, 0.15);
+    border-radius: 18px;
+    padding: 36px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+  }
+  .badge {
+    display: inline-block;
+    padding: 6px 14px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #ffffff;
+    font-weight: 600;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  h1 { margin: 18px 0 4px; font-size: 28px; }
+  .sub { color: #94a3b8; margin-bottom: 28px; }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+  }
+  .stat {
+    background: #111827;
+    border: 1px solid rgba(148,163,184,0.1);
+    border-radius: 12px;
+    padding: 14px 16px;
+  }
+  .stat .label { font-size: 11px; text-transform: uppercase; color: #64748b; letter-spacing: .06em; }
+  .stat .value { font-size: 16px; font-weight: 600; margin-top: 4px; word-break: break-all; }
+  .footer { margin-top: 26px; font-size: 12px; color: #475569; text-align: center; }
+  .pulse {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--accent); display: inline-block; margin-right: 8px;
+    animation: pulse 1.6s infinite;
+  }
+  @keyframes pulse { 0% {opacity:.4} 50% {opacity:1} 100% {opacity:.4} }
+</style>
+</head>
+<body>
+  <div class="card">
+    <span class="badge">{{ meta.color }} &middot; {{ meta.version }}</span>
+    <h1><span class="pulse"></span>Cloud Run Demo Service</h1>
+    <div class="sub">Live metadata pulled straight from the running container/revision</div>
+
+    <div class="grid">
+      <div class="stat"><div class="label">Service</div><div class="value">{{ meta.service }}</div></div>
+      <div class="stat"><div class="label">Revision</div><div class="value">{{ meta.revision }}</div></div>
+      <div class="stat"><div class="label">Configuration</div><div class="value">{{ meta.configuration }}</div></div>
+      <div class="stat"><div class="label">Instance Hostname</div><div class="value">{{ meta.hostname }}</div></div>
+      <div class="stat"><div class="label">Requests on this instance</div><div class="value">{{ meta.hit_count }}</div></div>
+      <div class="stat"><div class="label">Server Time (UTC)</div><div class="value">{{ meta.utc_time }}</div></div>
+    </div>
+
+    <div class="footer">Try /health and /api/info &middot; Refresh a few times and watch the hit counter &middot; Deploy blue vs green and compare</div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,53 @@
+# Alternative to the GitHub Actions workflow: a native Cloud Build pipeline.
+# Trigger this by connecting your GitHub repo in:
+#   Cloud Console -> Cloud Build -> Triggers -> Create Trigger
+# No GitHub secrets or Workload Identity Federation setup needed since
+# Cloud Build runs *inside* Google Cloud with its own service account.
+
+steps:
+  # 1. Build the image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', '${_IMAGE}:${SHORT_SHA}', '-t', '${_IMAGE}:latest', '.']
+
+  # 2. Push both tags to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_IMAGE}:${SHORT_SHA}']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_IMAGE}:latest']
+
+  # 3. Deploy the new revision with ZERO production traffic + a "green" tag
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE}'
+      - '--image=${_IMAGE}:${SHORT_SHA}'
+      - '--region=${_REGION}'
+      - '--no-traffic'
+      - '--tag=green'
+      - '--set-env-vars=APP_COLOR=green,APP_VERSION=${SHORT_SHA}'
+
+  # 4. Promote green -> 100% traffic once you're happy (remove this step
+  #    if you want manual promotion via `gcloud run services update-traffic`)
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'services'
+      - 'update-traffic'
+      - '${_SERVICE}'
+      - '--region=${_REGION}'
+      - '--to-tags=green=100'
+
+images:
+  - '${_IMAGE}:${SHORT_SHA}'
+  - '${_IMAGE}:latest'
+
+substitutions:
+  _SERVICE: cloudrun-demo
+  _REGION: us-central1
+  _IMAGE: us-central1-docker.pkg.dev/${PROJECT_ID}/cloudrun-demo-repo/cloudrun-demo
+
+options:
+  logging: CLOUD_LOGGING_ONLY
