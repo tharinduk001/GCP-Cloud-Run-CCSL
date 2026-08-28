@@ -60,6 +60,13 @@ Enable the required services:
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com
 ```
 
+For a 2nd-generation Cloud Build connection to GitHub, also enable Secret
+Manager because Google stores the GitHub App access token there:
+
+```powershell
+gcloud services enable secretmanager.googleapis.com
+```
+
 Create an Artifact Registry repository once:
 
 ```powershell
@@ -114,6 +121,10 @@ gcloud run services update-traffic cloudrun-demo --region=us-central1 --to-tags=
 ## Cloud Build
 
 [`cloudbuild.yaml`](cloudbuild.yaml) builds and pushes the image, deploys a green revision, and promotes it to 100% traffic.
+
+When creating a 2nd-generation GitHub repository connection, enable
+`secretmanager.googleapis.com` first. The connection uses Secret Manager to
+store the GitHub App access token.
 
 Create a Cloud Build trigger connected to this repository and configure these substitutions when needed:
 

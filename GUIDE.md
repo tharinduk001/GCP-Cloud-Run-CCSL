@@ -128,7 +128,7 @@ gcloud config set project your-unique-project-id
 ### 3.3 Enable the required APIs
 
 ```powershell
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com --project=your-unique-project-id
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com secretmanager.googleapis.com --project=your-unique-project-id
 ```
 
 | API | Why you need it |
@@ -137,6 +137,7 @@ gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudb
 | `artifactregistry.googleapis.com` | Stores your Docker images (Container Registry is retired) |
 | `cloudbuild.googleapis.com` | Cloud Build itself — image builds + triggers |
 | `iam.googleapis.com` / `iamcredentials.googleapis.com` / `sts.googleapis.com` | IAM management, needed for creating the dedicated Cloud Build service account (Phase 7) |
+| `secretmanager.googleapis.com` | Required for 2nd-gen Cloud Build repository connections — Google stores the GitHub App's access token here. Missable: the Console's "Link repository" wizard auto-enables it silently, but the pure-CLI path does not. |
 
 ### 3.4 Set a default region
 
@@ -546,6 +547,7 @@ gcloud projects delete your-unique-project-id
 | `docker push` gets `denied` | Run `gcloud auth configure-docker us-central1-docker.pkg.dev` again |
 | `service.spec...image: expected a container image path...` | Your `--image` value contains a literal, un-expanded `${...}` — use `"$($env:IMAGE)"` |
 | `INVALID_ARGUMENT` on `gcloud builds triggers create github` (legacy flags) | You're using the legacy 1st-gen `--repo-name`/`--repo-owner` flags — needs a 2nd-gen repository connection instead (Phase 7.1) |
+| Creating a 2nd-gen connection via CLI fails on a Secret Manager permission/API error | `secretmanager.googleapis.com` isn't enabled — run the Phase 3.3 enable command again (it's easy to miss since the Console UI enables it for you silently) |
 | `INVALID_ARGUMENT` on `gcloud builds triggers create github` (2nd-gen path) | Either you passed a full URL instead of a bare repo name somewhere, or `--service-account` is missing entirely (needed at creation time even though it seems optional) |
 | Trigger creates fine but the *build* fails: `invalid value for 'build.service_account'` | You pointed the trigger at the **default** Cloud Build service account — create a dedicated one instead (Phase 7.3) |
 | `key in the template "..." is not a valid built-in substitution` | An all-caps bash variable in a `cloudbuild.yaml` inline script wasn't escaped — change `$VARNAME` to `$$VARNAME` for anything meant for bash, not Cloud Build |
