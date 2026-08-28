@@ -1,22 +1,35 @@
-# Alternative to the GitHub Actions workflow: a native Cloud Build pipeline.
+# Native Cloud Build pipeline with a health-gated, gradual canary rollout -
+# the same pattern real production systems use, not just a straight cutover.
+#
+# Flow: build -> push -> deploy green at 0% traffic -> SMOKE TEST (abort here
+# if it fails, blue keeps serving 100% the whole time) -> ramp 10% -> observe
+# -> ramp 50% -> observe -> ramp 100%.
+#
 # Trigger this by connecting your GitHub repo in:
-#   Cloud Console -> Cloud Build -> Triggers -> Create Trigger
-# No GitHub secrets or Workload Identity Federation setup needed since
-# Cloud Build runs *inside* Google Cloud with its own service account.
+#   Cloud Console -> Cloud Build -> Repositories -> Link repository (2nd gen)
+# then creating a trigger with a DEDICATED (non-default) service account -
+# see GUIDE.md Phase 7 Option B for the exact commands, including the
+# specific IAM roles that service account needs.
 
 steps:
   # 1. Build the image
   - name: 'gcr.io/cloud-builders/docker'
+    id: build
     args: ['build', '-t', '${_IMAGE}:${SHORT_SHA}', '-t', '${_IMAGE}:latest', '.']
 
   # 2. Push both tags to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
+    id: push-sha
     args: ['push', '${_IMAGE}:${SHORT_SHA}']
   - name: 'gcr.io/cloud-builders/docker'
+    id: push-latest
     args: ['push', '${_IMAGE}:latest']
 
-  # 3. Deploy the new revision with ZERO production traffic + a "green" tag
+  # 3. Deploy the new revision with ZERO production traffic + a "green" tag.
+  #    Production traffic keeps flowing to the previous ("blue") revision
+  #    untouched while this happens.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: deploy-green
     entrypoint: gcloud
     args:
       - 'run'
@@ -28,9 +41,83 @@ steps:
       - '--tag=green'
       - '--set-env-vars=APP_COLOR=green,APP_VERSION=${SHORT_SHA}'
 
-  # 4. Promote green -> 100% traffic once you're happy (remove this step
-  #    if you want manual promotion via `gcloud run services update-traffic`)
+  # 4. SMOKE TEST GATE. Look up green's private tagged URL (via JSON, since
+  #    `gcloud run services describe` does not support --filter) and poll
+  #    its /health endpoint with retries, because a freshly deployed
+  #    revision can take a few seconds to become ready. If this step exits
+  #    non-zero, Cloud Build stops the whole pipeline right here - green
+  #    never receives a single percent of production traffic, and blue
+  #    keeps serving 100% the entire time. This is the gate a real rollout
+  #    needs and a straight-to-100 promotion skips.
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: smoke-test
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        set -e
+        GREEN_URL=$(gcloud run services describe ${_SERVICE} --region=${_REGION} --format=json \
+          | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(t['url'] for t in d['status']['traffic'] if t.get('tag')=='green'))")
+        echo "Smoke testing green revision at: $GREEN_URL"
+        for i in $(seq 1 "${_SMOKE_TEST_RETRIES}"); do
+          if curl -sf "$GREEN_URL/health" > /dev/null; then
+            echo "Smoke test passed on attempt $i - green is healthy."
+            exit 0
+          fi
+          echo "Attempt $i/${_SMOKE_TEST_RETRIES} failed, retrying in 5s..."
+          sleep 5
+        done
+        echo "Smoke test FAILED after ${_SMOKE_TEST_RETRIES} attempts - aborting rollout. Blue is untouched."
+        exit 1
+
+  # 5. Canary stage 1: shift a small slice of real traffic to green and
+  #    observe. In real production this "observe" window is minutes to
+  #    hours long and gated on Cloud Monitoring error-rate/latency alerts,
+  #    not a fixed sleep - _CANARY_WAIT_SECONDS is shortened here so a live
+  #    demo doesn't take forever. Say this out loud when presenting.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: canary-10
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'services'
+      - 'update-traffic'
+      - '${_SERVICE}'
+      - '--region=${_REGION}'
+      - '--to-tags=green=${_CANARY_STAGE_1}'
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: observe-10
+    entrypoint: bash
+    args:
+      - '-c'
+      - 'echo "Observing green at ${_CANARY_STAGE_1}% for ${_CANARY_WAIT_SECONDS}s (a real rollout would watch error-rate/latency metrics here)..."; sleep ${_CANARY_WAIT_SECONDS}'
+
+  # 6. Canary stage 2: expand to the midpoint and observe again
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: canary-50
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'services'
+      - 'update-traffic'
+      - '${_SERVICE}'
+      - '--region=${_REGION}'
+      - '--to-tags=green=${_CANARY_STAGE_2}'
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: observe-50
+    entrypoint: bash
+    args:
+      - '-c'
+      - 'echo "Observing green at ${_CANARY_STAGE_2}% for ${_CANARY_WAIT_SECONDS}s..."; sleep ${_CANARY_WAIT_SECONDS}'
+
+  # 7. Full promotion - green becomes the new "blue" for the next deploy.
+  #    The previous revision is NOT deleted; it stays at 0% and is one
+  #    `gcloud run services update-traffic --to-tags=blue=100` away from
+  #    an instant rollback if something is discovered after this point.
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: promote-100
     entrypoint: gcloud
     args:
       - 'run'
@@ -48,6 +135,10 @@ substitutions:
   _SERVICE: cloudrun-demo
   _REGION: us-central1
   _IMAGE: us-central1-docker.pkg.dev/${PROJECT_ID}/cloudrun-demo-repo/cloudrun-demo
+  _SMOKE_TEST_RETRIES: '10'      # 10 x 5s = up to 50s waiting for green to become ready
+  _CANARY_STAGE_1: '10'          # first canary slice, in percent
+  _CANARY_STAGE_2: '50'          # second canary slice, in percent
+  _CANARY_WAIT_SECONDS: '30'     # shortened for demo purposes - see comment above
 
 options:
   logging: CLOUD_LOGGING_ONLY
